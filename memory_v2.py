@@ -980,6 +980,8 @@ def _call_sonnet(prompt: str, timeout: int = 60, effort: Optional[str] = None) -
     cmd = [
         _CLAUDE_EXE,
         "-p",
+        "--strict-mcp-config",
+        "--disable-slash-commands",
         "--output-format", "stream-json",
         "--verbose",
         "--model", "sonnet",

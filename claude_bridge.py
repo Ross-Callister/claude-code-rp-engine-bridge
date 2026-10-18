@@ -88,6 +88,12 @@ def _find_claude_exe():
 
 CLAUDE_EXE = _find_claude_exe()
 
+# Every CLI call runs without the user's MCP servers and skills. The bridge
+# never uses them, and their tool definitions sit at the very front of the
+# prompt: ~10K tokens per call, and when a remote connector's tool list
+# changes (or it fails to connect) the whole prompt cache misses.
+CLI_ISOLATION_ARGS = ["--strict-mcp-config", "--disable-slash-commands"]
+
 # Character Memory v2 (see memory_v2.py + MEMORY_DESIGN.md). Imported
 # unconditionally — the toggle in runtime_settings gates the *behavior*.
 # Logger and exe path are injected after both are defined further below.
@@ -327,6 +333,7 @@ Match the level of detail and tone to the scene above. If the scene is intimate 
             [
                 CLAUDE_EXE,
                 "-p",
+                *CLI_ISOLATION_ARGS,
                 "--output-format", "stream-json",
                 "--verbose",
                 "--tools", "Read",
@@ -1263,6 +1270,7 @@ If nothing new: output NO_NEW_LORE"""
             [
                 CLAUDE_EXE,
                 "-p",
+                *CLI_ISOLATION_ARGS,
                 "--output-format", "stream-json",
                 "--verbose",
                 "--model", "sonnet",  # Use Sonnet for background analysis (faster/cheaper)
@@ -1536,6 +1544,7 @@ If nothing new worth adding: output NO_NEW_LORE"""
                 [
                     CLAUDE_EXE,
                     "-p",
+                    *CLI_ISOLATION_ARGS,
                     "--output-format", "stream-json",
                     "--verbose",
                     "--model", model,
@@ -1783,7 +1792,7 @@ CORS(app)  # Enable CORS for SillyTavern
 # CONFIGURATION - Edit these settings as needed
 # =============================================================================
 
-DEFAULT_MODEL = "claude-opus-4-8"  # Model name to report
+DEFAULT_MODEL = "claude-opus-5-5"  # Model name to report (the "opus" alias resolves to the latest Opus)
 
 # Default bridge system prompt. Single source of truth for both the request
 # handler (via runtime_settings.system_prompt_override fallback) and the GUI
@@ -1916,8 +1925,7 @@ runtime_settings = {
     "debug_output": DEBUG_RAW_OUTPUT,
     # Simple chunking toggle (one-shot)
     "chunking_enabled": False,
-    # Model selection: "opus" (latest), "claude-opus-4-8", "claude-opus-4-6", or "sonnet"
-    # Note: 4.7 was deprecated and is no longer available
+    # Model selection: "opus" (latest, currently Opus 5.5), "claude-opus-4-6", or "sonnet"
     "model": "opus",
     # Tool calling support for extensions like TunnelVision
     "tool_calling_enabled": True,
@@ -1953,6 +1961,14 @@ runtime_settings = {
     # to the unchanged-prefix portion of the payload — falls back to the
     # full-prompt path transparently. Disable if you see unexpected behavior.
     "cli_session_reuse": True,
+    # Prompt-cache passthrough. When a client marks content parts with
+    # `cache_control` (Anthropic-style breakpoints, as sent by clients that
+    # lay out their prompt for caching), the prompt is sent to the CLI as
+    # separate content blocks with one of those breakpoints kept, instead of
+    # one flattened string. Without it, the CLI's only breakpoint sits at the
+    # end of the prompt, so any change near the end (a new turn) rewrites the
+    # whole prompt to cache. Requests without cache_control are unaffected.
+    "cache_passthrough": True,
     # Check the bridge's GitHub releases on startup and warn if a newer
     # version is available. Single unauthenticated API call, runs on a
     # background thread so it never blocks startup. No auto-update — just
@@ -1986,7 +2002,7 @@ PERSISTED_SETTING_KEYS = {
     "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name",
     "system_prompt_override", "thinking_prompt", "no_thinking_prompt",
     "creativity", "bridge_port",
-    "cli_session_reuse", "update_check_enabled",
+    "cli_session_reuse", "cache_passthrough", "update_check_enabled",
     "character_memory_v2_enabled", "pinned_char_key",
 }
 
@@ -2599,6 +2615,87 @@ def _update_session(char_key: str, session_id: str, messages: list):
 _load_sessions()
 
 
+# ============================================================================
+# PROMPT-CACHE PASSTHROUGH
+# ============================================================================
+# The CLI already places 3 cache breakpoints of its own (system prompt and the
+# end of the last message), and the API allows 4, so we can forward exactly
+# one of the client's. While the prompt is assembled, every client content
+# part is followed by a marker (private-use characters that never occur in
+# real text); just before the call the finished prompt is cut at those
+# markers into content blocks. Keeping the client's part boundaries as block
+# boundaries matters: when the kept breakpoint moves forward (a story grows
+# a new block), the API's lookback finds the previous turn's cache entry at
+# an earlier block boundary instead of missing the whole prefix.
+_PART_END = ""         # end of a client content part
+_PART_END_CACHED = ""  # end of a client content part marked cache_control
+
+# Set when the API rejects a forwarded breakpoint (e.g. a future CLI uses all
+# 4 itself). Passthrough then stays off until the bridge restarts.
+_cache_passthrough_failed = False
+
+
+def _cache_passthrough_on() -> bool:
+    return runtime_settings.get("cache_passthrough", True) and not _cache_passthrough_failed
+
+
+def _disable_cache_passthrough():
+    global _cache_passthrough_failed
+    _cache_passthrough_failed = True
+    log("The API rejected the forwarded cache breakpoint; cache passthrough is off until restart. Retry the request.", "WARN")
+
+
+def _strip_part_marks(text: str) -> str:
+    return text.replace(_PART_END, "").replace(_PART_END_CACHED, "")
+
+
+def _cache_blocks(prompt: str):
+    """Cut a marked prompt into Anthropic text blocks with one cache breakpoint.
+
+    Returns None when the client marked nothing as cacheable. Keeps the
+    client's last breakpoint, the usual place for one (the end of the history
+    so far). On the next turn the API finds this turn's entry by looking back
+    over earlier block boundaries, which is why every client part stays its
+    own block.
+    """
+    pieces = re.split(f"([{_PART_END}{_PART_END_CACHED}])", prompt)
+    blocks = []  # [text, cached]
+    for piece in pieces:
+        if piece == _PART_END:
+            continue
+        if piece == _PART_END_CACHED:
+            if blocks:
+                blocks[-1][1] = True
+            continue
+        if piece:
+            blocks.append([piece, False])
+    marked = [i for i, (_, cached) in enumerate(blocks) if cached]
+    if not marked:
+        return None
+    keep = marked[-1]
+    out = []
+    for i, (text, _) in enumerate(blocks):
+        block = {"type": "text", "text": text}
+        if i == keep:
+            # 1h, not the default 5m: the CLI's own breakpoints are 1h on
+            # subscription plans, and a 5m breakpoint may not precede a 1h one.
+            block["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+        out.append(block)
+    return out
+
+
+def _openai_usage(input_tokens, cache_read, cache_write, output_tokens) -> dict:
+    """Token usage in OpenAI's shape, with Anthropic's cache split in the
+    details fields OpenRouter uses (cached_tokens / cache_write_tokens)."""
+    prompt_tokens = input_tokens + cache_read + cache_write
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "prompt_tokens_details": {"cached_tokens": cache_read, "cache_write_tokens": cache_write},
+    }
+
+
 def call_claude_code(messages: list, tools: list = None, process_holder: dict = None, char_key: str = None, json_schema: dict = None, skip_memory: bool = False, tracking_messages: list = None) -> dict:
     """
     Call Claude Code CLI with the given messages.
@@ -2632,6 +2729,7 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
     # Find the last 5 message indices to process images from (any role)
     # SillyTavern may put attachments in system messages
     recent_msg_indices = set(range(max(0, len(messages) - 5), len(messages)))
+    mark_parts = _cache_passthrough_on()
 
     for idx, msg in enumerate(messages):
         role = msg.get("role", "user")
@@ -2648,7 +2746,10 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
             text_parts = []
             for part_idx, part in enumerate(content):
                 if part.get("type") == "text":
-                    text_parts.append(part.get("text", ""))
+                    text = part.get("text", "")
+                    if mark_parts:
+                        text += _PART_END_CACHED if part.get("cache_control") else _PART_END
+                    text_parts.append(text)
                 elif part.get("type") == "image_url" and is_recent_msg:
                     # Only extract images from recent user messages
                     img_url = part.get("image_url", {}).get("url", "")
@@ -2678,7 +2779,10 @@ def call_claude_code(messages: list, tools: list = None, process_holder: dict = 
             processed_images = sum(1 for t in text_parts if "[VISUAL REFERENCE" in t)
             if processed_images > 0:
                 log(f"  Processed {processed_images} image(s) into descriptions", "SUCCESS")
-            content = "\n".join(text_parts)
+            # Parts laid out for caching are meant to be read back to back
+            # (the API concatenates text blocks), and may split mid-paragraph.
+            cache_layout = any(isinstance(p, dict) and p.get("cache_control") for p in msg.get("content", []))
+            content = ("" if cache_layout else "\n").join(text_parts)
         else:
             # Only extract base64 images from recent user messages
             if is_recent_msg:
@@ -2990,9 +3094,15 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             if runtime_settings.get("debug_output") and resume_char_key and resume_char_key != "default":
                 log(f"Not resuming [{resume_char_key}]: {resume_reason}", "INFO")
 
+    # A resumed turn sends only the newest user text (no part markers), so
+    # this only applies to full prompts.
+    cache_blocks = _cache_blocks(prompt) if mark_parts and not resume_session_id else None
+    prompt = _strip_part_marks(prompt)
+
     cmd = [
         CLAUDE_EXE,
         "-p",
+        *CLI_ISOLATION_ARGS,
         "--output-format", "stream-json",
         "--verbose",
         "--effort", effort,
@@ -3016,6 +3126,13 @@ Use the Read tool to view each, then weave the visual details into your scene wi
 
     if resume_session_id:
         cmd.extend(["--resume", resume_session_id])
+
+    if cache_blocks:
+        cmd.extend(["--input-format", "stream-json"])
+        if runtime_settings.get("debug_output"):
+            kept = next(i for i, b in enumerate(cache_blocks) if "cache_control" in b)
+            cached_chars = sum(len(b["text"]) for b in cache_blocks[:kept + 1])
+            log(f"Cache passthrough: {len(cache_blocks)} blocks, breakpoint after {cached_chars:,} of {len(prompt):,} chars", "INFO")
 
     # Add core identity as system prompt via file rather than inline argv.
     # Windows caps the total command line at ~32K chars (CreateProcessW
@@ -3069,7 +3186,13 @@ Use the Read tool to view each, then weave the visual details into your scene wi
             process_holder["process"] = process
 
         # Send prompt and close stdin
-        process.stdin.write(prompt)
+        if cache_blocks:
+            process.stdin.write(json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": cache_blocks},
+            }) + "\n")
+        else:
+            process.stdin.write(prompt)
         process.stdin.close()
 
         # Read output line by line as it streams
@@ -3163,6 +3286,8 @@ Use the Read tool to view each, then weave the visual details into your scene wi
                     if event.get("is_error"):
                         error_msg = event.get("result", "Unknown error")
                         log(f"Claude Code returned error: {error_msg}", "ERROR")
+                        if cache_blocks and "cache_control" in str(error_msg):
+                            _disable_cache_passthrough()
                         return {"response": f"Error: {error_msg}", "thinking": None}
 
                     # When a json_schema was supplied, the CLI validates the
@@ -3380,7 +3505,8 @@ Use the Read tool to view each, then weave the visual details into your scene wi
         return {
             "response": clean_response,
             "thinking": thinking_text.strip() if thinking_text else None,
-            "tool_calls": tool_calls
+            "tool_calls": tool_calls,
+            "usage": _openai_usage(input_tokens_max, cache_read_max, cache_creation_max, output_tokens_max),
         }
 
     except FileNotFoundError as e:
@@ -4021,6 +4147,8 @@ Now, based on this context, please respond to the following request:
                         "model": DEFAULT_MODEL,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
+                    if result.get("usage"):
+                        final_chunk["usage"] = result["usage"]
                     yield f"data: {json.dumps(content_chunk)}\n\n"
                     yield f"data: {json.dumps(final_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
@@ -4035,7 +4163,7 @@ Now, based on this context, please respond to the following request:
                             "message": {"role": "assistant", "content": response_text},
                             "finish_reason": "stop",
                         }],
-                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        "usage": result.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     })
             finally:
                 # Cancel-on-disconnect: the keepalive yields above force
@@ -4080,7 +4208,7 @@ def list_models():
                 "owned_by": "anthropic"
             },
             {
-                "id": "claude-sonnet-4-20250514",
+                "id": "claude-sonnet-5-5",
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "anthropic"
@@ -4154,7 +4282,7 @@ def update_settings():
         log(f"CHUNKING: {old_val} -> {new_val}")
 
     memory_v2_was_enabled = runtime_settings.get("character_memory_v2_enabled", False)
-    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "thinking_prompt", "no_thinking_prompt", "creativity", "bridge_port", "cli_session_reuse", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key"]:
+    for key in ["effort_level", "include_thinking", "show_thinking_console", "debug_output", "model", "tool_calling_enabled", "auto_summary_enabled", "auto_summary_threshold", "auto_summary_max_length", "lorebook_enabled", "lorebook_path", "lorebook_name", "system_prompt_override", "thinking_prompt", "no_thinking_prompt", "creativity", "bridge_port", "cli_session_reuse", "cache_passthrough", "update_check_enabled", "character_memory_v2_enabled", "pinned_char_key"]:
         if key in data:
             # Coerce bridge_port to int and bounds-check. Invalid values are rejected.
             if key == "bridge_port":
@@ -5107,7 +5235,7 @@ def generate_summary_from_file():
                 )
 
                 process = subprocess.Popen(
-                    [CLAUDE_EXE, "-p", "--output-format", "stream-json", "--verbose", "--model", model],
+                    [CLAUDE_EXE, "-p", *CLI_ISOLATION_ARGS, "--output-format", "stream-json", "--verbose", "--model", model],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -5148,7 +5276,7 @@ def generate_summary_from_file():
                     condense_prompt = load_prompt("condense_chronological", combined=combined)
 
                     process = subprocess.Popen(
-                        [CLAUDE_EXE, "-p", "--output-format", "stream-json", "--verbose", "--model", model],
+                        [CLAUDE_EXE, "-p", *CLI_ISOLATION_ARGS, "--output-format", "stream-json", "--verbose", "--model", model],
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
